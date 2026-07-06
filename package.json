@@ -1,0 +1,16 @@
+{
+  "name": "lightning-janitor-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for Lightning AI, fixing CORS/content-format issues with Janitor AI",
+  "main": "lightning-server.js",
+  "scripts": {
+    "start": "node lightning-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
