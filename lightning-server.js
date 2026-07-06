@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
@@ -11,6 +12,10 @@ app.use(express.json({ limit: "20mb" }));
 const LIGHTNING_API_KEY = process.env.LIGHTNING_API_KEY;
 const LIGHTNING_API_BASE = "https://lightning.ai/api/v1";
 const REQUEST_TIMEOUT_MS = 120_000;
+
+// Force thinking mode on for every request by default. Set FORCE_THINKING=false
+// in your environment to disable this and only think when the client asks for it.
+const FORCE_THINKING = process.env.FORCE_THINKING !== "false";
 
 if (!LIGHTNING_API_KEY) {
   console.warn("⚠️ LIGHTNING_API_KEY not set");
@@ -57,12 +62,29 @@ function flattenContent(content) {
 }
 
 function buildBody(body, model) {
-  const { messages, ...rest } = body;
-  return {
+  const { messages, enable_reasoning, chat_template_kwargs, ...rest } = body;
+
+  const final = {
     ...rest,
     model,
     messages: normalizeMessages(messages),
   };
+
+  // Force thinking mode on by default (FORCE_THINKING env var), unless the
+  // client explicitly sent enable_reasoning: false to opt out for this
+  // specific request.
+  const wantsThinking = enable_reasoning !== false && (FORCE_THINKING || enable_reasoning === true);
+
+  if (wantsThinking) {
+    final.chat_template_kwargs = {
+      ...(chat_template_kwargs || {}),
+      enable_thinking: true,
+    };
+  } else if (chat_template_kwargs) {
+    final.chat_template_kwargs = chat_template_kwargs;
+  }
+
+  return final;
 }
 
 /* ------------------ ROUTES ------------------ */
@@ -151,8 +173,9 @@ app.post("/v1/chat/completions", async (req, res) => {
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let thinkOpen = false;
 
-    const flattenLine = (line) => {
+    const transformLine = (line) => {
       if (!line.startsWith("data: ")) return line;
       const jsonStr = line.slice(6).trim();
       if (!jsonStr || jsonStr === "[DONE]") return line;
@@ -166,10 +189,22 @@ app.post("/v1/chat/completions", async (req, res) => {
       if (!parsed.choices) return line;
 
       parsed.choices = parsed.choices.map((choice) => {
-        if (choice.delta && "content" in choice.delta) {
-          choice.delta.content = flattenContent(choice.delta.content);
+        const delta = { ...(choice.delta || {}) };
+        const reasoning = delta.reasoning_content;
+        let content = flattenContent(delta.content) || "";
+
+        if (reasoning) {
+          content = (thinkOpen ? "" : "<think>") + reasoning + content;
+          thinkOpen = true;
+        } else if (thinkOpen) {
+          content = "</think>" + content;
+          thinkOpen = false;
         }
-        return choice;
+
+        delta.content = content;
+        delete delta.reasoning_content;
+
+        return { ...choice, delta };
       });
 
       return `data: ${JSON.stringify(parsed)}`;
@@ -184,9 +219,17 @@ app.post("/v1/chat/completions", async (req, res) => {
         const lines = buffer.split("\n");
         buffer = lines.pop(); // keep possibly-incomplete trailing line
 
-        res.write(lines.map(flattenLine).join("\n") + (lines.length ? "\n" : ""));
+        res.write(lines.map(transformLine).join("\n") + (lines.length ? "\n" : ""));
       }
-      if (buffer) res.write(flattenLine(buffer));
+
+      let tail = "";
+      if (buffer) tail += transformLine(buffer);
+      if (thinkOpen) {
+        tail += (tail ? "\n" : "") + `data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { content: "</think>" } }],
+        })}`;
+      }
+      if (tail) res.write(tail);
     } catch (err) {
       if (err.name !== "AbortError") console.error("stream error:", err);
     } finally {
@@ -203,9 +246,16 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     if (Array.isArray(data.choices)) {
       data.choices = data.choices.map((choice) => {
-        if (choice.message && "content" in choice.message) {
-          choice.message.content = flattenContent(choice.message.content);
-        }
+        if (!choice.message) return choice;
+
+        const reasoning = choice.message.reasoning_content;
+        const content = flattenContent(choice.message.content) || "";
+
+        choice.message.content = reasoning
+          ? `<think>\n${reasoning}\n</think>\n\n${content}`
+          : content;
+        delete choice.message.reasoning_content;
+
         return choice;
       });
     }
